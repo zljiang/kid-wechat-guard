@@ -33,9 +33,9 @@ object ProcessState {
         return enabled.split(':').any { it.equals(expected, ignoreCase = true) }
     }
 
-    /** 界面跳转用：当前锁屏内容。 */
-    var lockCategory: Category = Category.OTHER
-    var lockReason: String = ""
+    /** 界面跳转用：当前锁屏内容（引擎线程写、主线程读）。 */
+    @Volatile var lockCategory: Category = Category.OTHER
+    @Volatile var lockReason: String = ""
 
     fun dismissLock() {
         val a = lockActivity

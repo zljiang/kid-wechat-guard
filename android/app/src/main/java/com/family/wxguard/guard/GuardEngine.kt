@@ -19,6 +19,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.util.EnumMap
 
 enum class EngineState { NORMAL, GRACE, LOCKED }
 
@@ -32,7 +33,12 @@ enum class LockReason(val text: String) {
  * - 每秒采样 [ProcessState.category]；
  * - 禁止类容器：进入即锁定；
  * - 限额类容器：累计用量 → 配额耗尽进入缓冲 → 缓冲结束锁定；
- * - 离开被盯防的容器时自动解除锁定状态。
+ * - 缓冲/锁定状态按 [Category] 独立维护（[CatState]），跨"离开容器"保留：
+ *   离开仅暂停，重新进入继续倒计时/恢复锁定页，防止"退出重进"刷新缓冲；
+ *   按类别隔离也杜绝了"换类别一进一出"重置另一类别缓冲的跨类别污染；
+ *   仅该类别自身配额恢复（次日清零/家长上调）时复位。
+ * - 所有状态迁移经 [engineLock] 串行化（ticker 后台线程 × 无障碍主线程），
+ *   避免进入瞬间的复合迁移竞态（双发缓冲/拦截）。
  */
 object GuardEngine {
     private var context: Context? = null
@@ -40,14 +46,28 @@ object GuardEngine {
     private var scope: CoroutineScope? = null
     private var ticker: Job? = null
 
-    @Volatile var state: EngineState = EngineState.NORMAL
-    @Volatile var lockReason: LockReason = LockReason.QUOTA_EXCEEDED
+    /** 状态迁移统一互斥锁；锁内只做内存读写与 post，不等待主线程，无死锁风险。 */
+    private val engineLock = Any()
+
     @Volatile var activeCategory: Category = Category.OTHER
-    @Volatile var graceRemainMs: Long = 0L
     @Volatile var lastTransitionAt: Long = 0L
 
-    /** 家长密码解锁后：本次停留在该容器的会话内不再拦截，离开即失效。 */
-    @Volatile var unlockUntilLeave: Boolean = false
+    /** 当前缓冲提醒通知所属的类别；null = 当前无提醒（离开容器/已锁定时取消）。 */
+    @Volatile private var graceReminderCat: Category? = null
+
+    /** 单个被盯防类别的守护状态（配额/缓冲/锁定互不串扰）。 */
+    private class CatState {
+        @Volatile var state: EngineState = EngineState.NORMAL
+        @Volatile var graceRemainMs: Long = 0L
+        @Volatile var unlockUntilLeave: Boolean = false
+        @Volatile var lockReason: LockReason = LockReason.QUOTA_EXCEEDED
+    }
+
+    private val catStates = EnumMap<Category, CatState>(Category::class.java)
+
+    private fun catState(c: Category): CatState = synchronized(catStates) {
+        catStates.getOrPut(c) { CatState() }
+    }
 
     fun init(context: Context) {
         if (this.context != null) return
@@ -70,47 +90,64 @@ object GuardEngine {
 
     /** 无障碍服务每次判定前台类别变化后调用。 */
     fun onForegroundChanged(cat: Category) {
-        val wasMonitored = activeCategory.monitored()
-        val nowMonitored = cat.monitored()
+        synchronized(engineLock) {
+            val was = activeCategory
+            // 切到非盯防窗口、或直接切到另一个被盯防类别（mini→channels），
+            // 都要结束上一类别的会话状态（解锁失效/用量落盘）。
+            if (was.monitored() && was != cat) handleLeftContainer(was)
+            activeCategory = cat
+            lastTransitionAt = System.currentTimeMillis()
 
-        // 离开被盯防容器：清掉缓冲/锁定等会话状态（用量保留）。
-        if (wasMonitored && !nowMonitored) {
-            state = EngineState.NORMAL
-            unlockUntilLeave = false
-            graceRemainMs = 0
-            NotificationHelper.cancelGraceReminder()
-            dismissLock()
+            if (cat.monitored()) evaluateNow(cat)
         }
-        activeCategory = cat
-        lastTransitionAt = System.currentTimeMillis()
-
-        if (nowMonitored) evaluateNow()
     }
 
-    private fun tick() {
-        val cat = ProcessState.category
-        if (cat != activeCategory) {
-            activeCategory = cat
-            if (activeCategory.monitored()) evaluateNow()
-            return
+    /** 离开被盯防容器：会话相关状态复位（家长放行、锁定页、用量落盘）。
+     *  该类别自身的 GRACE/LOCKED 保留——重新进入时继续推进，缓冲剩余时间不重置。 */
+    private fun handleLeftContainer(fromCat: Category) {
+        catState(fromCat).unlockUntilLeave = false
+        cancelGraceReminder()
+        UsageStore.flush()
+        dismissLock()
+    }
+
+    /** 取消缓冲提醒并清除其类别标记（重进续跑缓冲时按标记补发）。 */
+    private fun cancelGraceReminder() {
+        graceReminderCat = null
+        NotificationHelper.cancelGraceReminder()
+    }
+
+    private fun tick() = synchronized(engineLock) {
+        val cur = ProcessState.category
+        if (cur != activeCategory) {
+            // 兜底对齐前台类别（无障碍事件偶发丢失/合并时，靠采样发现变化）。
+            val was = activeCategory
+            activeCategory = cur
+            if (was.monitored() && was != cur) handleLeftContainer(was)
+            if (cur.monitored()) evaluateNow(cur)
+            return@synchronized
         }
-        if (!cat.monitored()) return
-        // 处于锁定/本会话已放行时不做配额累计推进，但仍保持锁定状态展示
-        if (state == EngineState.LOCKED) return
-        // 无前台可见场景（熄屏）或无障碍感知通道不在线时，不累计、不推进状态，
-        // 避免基于“最后一条窗口事件”的陈旧类别在熄屏/失联期间空计配额或误锁。
+        if (!cur.monitored()) return
+        // 熄屏 / 无障碍失联期间不推进任何状态（含锁定页重拉与缓冲倒计时），
+        // 避免空计配额、误锁，以及熄屏时反复尝试后台拉起 Activity。
         if (!screenInteractive()) return
         if (ProcessState.a11y == null) return
 
-        if (Cfg.policyFor(cat) == InnerPolicy.BLOCK) {
-            lock(LockReason.BLOCKED_BY_POLICY)
+        val cs = catState(cur)
+        // 锁定状态下保持锁定页常驻：即使锁定页被意外关闭（如代按返回仅关掉了页面），
+        // 下一个 tick 也会重新拉起，直到离开容器或家长解锁。
+        if (cs.state == EngineState.LOCKED) {
+            ensureLockShown(cur)
             return
         }
-
+        if (Cfg.policyFor(cur) == InnerPolicy.BLOCK) {
+            lock(cur, LockReason.BLOCKED_BY_POLICY)
+            return
+        }
         // QUOTA：先累计，再判定是否触发缓冲/锁定
-        if (!unlockUntilLeave) {
-            accumulateOneSecond(cat)
-            maybeEnforceQuota(cat)
+        if (!cs.unlockUntilLeave) {
+            accumulateOneSecond(cur)
+            maybeEnforceQuota(cur)
         }
     }
 
@@ -119,79 +156,114 @@ object GuardEngine {
     }
 
     private fun maybeEnforceQuota(cat: Category) {
+        val cs = catState(cat)
         val usedMs = UsageStore.usedSeconds(cat) * 1000
         val quotaMs = Cfg.quotaMinutes(cat, Cfg.isWeekend()) * 60_000L
         if (usedMs < quotaMs) {
-            // 仍有配额：若此前在缓冲，配额不可能恢复，忽略
+            // 配额未用尽（次日清零/家长上调）：复位本类别挂着的缓冲状态。
+            if (cs.state == EngineState.GRACE) {
+                cs.state = EngineState.NORMAL
+                cs.graceRemainMs = 0
+                cancelGraceReminder()
+            }
             return
         }
-        // 配额耗尽
-        if (state == EngineState.GRACE) {
-            graceRemainMs -= 1000
-            if (graceRemainMs <= 0) {
-                graceRemainMs = 0
-                NotificationHelper.cancelGraceReminder()
-                lock(LockReason.QUOTA_EXCEEDED)
-            } else {
-                val sec = graceRemainMs / 1000
+        // 配额耗尽：缓冲已在进行 → 推进倒计时（离开容器期间暂停，回到容器继续）；
+        // 否则给一次缓冲（每次耗尽只给一轮，耗尽状态跨离开保留，不会重复发）。
+        if (cs.state == EngineState.GRACE) {
+            cs.graceRemainMs -= 1000
+            if (cs.graceRemainMs <= 0) {
+                cs.graceRemainMs = 0
+                cancelGraceReminder()
+                lock(cat, LockReason.QUOTA_EXCEEDED)
+            } else if (graceReminderCat != cat) {
+                // 提醒在离开容器/切换类别时已被取消：重新进入续跑缓冲时补发一次，
+                // 倒计时从剩余时间起算；不随 tick 每秒重发。
                 NotificationHelper.showGraceReminder(
                     CfgCtx.title,
-                    CfgCtx.graceBody(cat, sec)
+                    CfgCtx.graceBody(cat),
+                    cs.graceRemainMs
                 )
+                graceReminderCat = cat
             }
         } else {
             val g = Cfg.graceMinutes() * 60_000L
             if (g <= 0) {
-                lock(LockReason.QUOTA_EXCEEDED)
+                lock(cat, LockReason.QUOTA_EXCEEDED)
             } else {
-                state = EngineState.GRACE
-                graceRemainMs = g
+                cs.state = EngineState.GRACE
+                cs.graceRemainMs = g
                 UsageStore.incrGrace(cat)
                 NotificationHelper.showGraceReminder(
                     CfgCtx.title,
-                    CfgCtx.graceBody(cat, g / 1000)
+                    CfgCtx.graceBody(cat),
+                    g
                 )
+                graceReminderCat = cat
             }
         }
     }
 
     /** 进入被盯防容器时的即时判定（禁止类秒拦、限额类若早已超额则立即走缓冲/锁定）。 */
-    private fun evaluateNow() {
-        val cat = activeCategory
-        if (!cat.monitored()) return
-        if (unlockUntilLeave) return
-        if (state == EngineState.LOCKED) return
+    private fun evaluateNow(cat: Category) {
+        val cs = catState(cat)
+        if (cs.unlockUntilLeave) return
 
-        val policy = Cfg.policyFor(cat)
-        if (policy == InnerPolicy.BLOCK) {
-            lock(LockReason.BLOCKED_BY_POLICY)
+        // 本类别配额已恢复（次日清零/家长上调）时清除其跨会话保留的缓冲/锁定状态，
+        // 避免"次日进入秒锁"。只看本类别，不影响其他类别的状态。
+        if (cs.state != EngineState.NORMAL &&
+            Cfg.policyFor(cat) == InnerPolicy.QUOTA &&
+            UsageStore.usedSeconds(cat) * 1000 <
+            Cfg.quotaMinutes(cat, Cfg.isWeekend()) * 60_000L
+        ) {
+            cs.state = EngineState.NORMAL
+            cs.graceRemainMs = 0
+            cancelGraceReminder()
+        }
+
+        when (cs.state) {
+            EngineState.LOCKED -> {
+                // 曾被锁定：离开容器不重置，重新进入立即恢复锁定页（缓冲已消耗完毕，不再重发）。
+                ensureLockShown(cat)
+                return
+            }
+            EngineState.GRACE -> return // 缓冲暂停后重新进入，由 tick 继续倒计时，不重新计时。
+            EngineState.NORMAL -> {}
+        }
+
+        if (Cfg.policyFor(cat) == InnerPolicy.BLOCK) {
+            lock(cat, LockReason.BLOCKED_BY_POLICY)
             return
         }
         val usedMs = UsageStore.usedSeconds(cat) * 1000
         val quotaMs = Cfg.quotaMinutes(cat, Cfg.isWeekend()) * 60_000L
-        if (usedMs >= quotaMs && state == EngineState.NORMAL) {
-            // 重新进入且今天已超额：直接给一次缓冲（若已处于缓冲则不打断）
+        if (usedMs >= quotaMs) {
             maybeEnforceQuota(cat)
         }
     }
 
-    private fun lock(reason: LockReason) {
-        if (state == EngineState.LOCKED) {
-            ensureLockShown()
+    private fun lock(cat: Category, reason: LockReason) {
+        val cs = catState(cat)
+        if (cs.state == EngineState.LOCKED) {
+            ensureLockShown(cat)
             return
         }
-        state = EngineState.LOCKED
-        lockReason = reason
-        UsageStore.incrIntercept(activeCategory)
-        NotificationHelper.cancelGraceReminder()
-        ensureLockShown()
+        cs.state = EngineState.LOCKED
+        cs.lockReason = reason
+        UsageStore.incrIntercept(cat)
+        UsageStore.flush()
+        cancelGraceReminder()
+        ensureLockShown(cat)
     }
 
-    private fun ensureLockShown() {
+    private fun ensureLockShown(cat: Category) {
         if (ProcessState.lockShowing) return
         val ctx = context ?: return
-        ProcessState.lockCategory = activeCategory
-        ProcessState.lockReason = lockReason.text
+        ProcessState.lockCategory = cat
+        // 锁定文案跟随该类别当前的实际策略，避免策略变更后文案错位。
+        ProcessState.lockReason =
+            if (Cfg.policyFor(cat) == InnerPolicy.BLOCK) LockReason.BLOCKED_BY_POLICY.text
+            else catState(cat).lockReason.text
         mainHandler.post {
             if (ProcessState.lockShowing) return@post
             val i = Intent(ctx, LockActivity::class.java)
@@ -200,13 +272,16 @@ object GuardEngine {
         }
     }
 
-    /** 家长密码解锁：本次会话放行。 */
+    /** 家长密码解锁：当前类别的本次会话放行，离开即失效（其他类别状态不受影响）。 */
     fun unlockByParent() {
-        unlockUntilLeave = true
-        state = EngineState.NORMAL
-        graceRemainMs = 0
-        NotificationHelper.cancelGraceReminder()
-        dismissLock()
+        synchronized(engineLock) {
+            val cs = catState(activeCategory)
+            cs.unlockUntilLeave = true
+            cs.state = EngineState.NORMAL
+            cs.graceRemainMs = 0
+            cancelGraceReminder()
+            dismissLock()
+        }
     }
 
     fun backToChat() {
@@ -233,19 +308,20 @@ object GuardEngine {
     fun miniUsedMin(): Int = usedCeilMin(Category.MINI_APP)
     fun channelUsedMin(): Int = usedCeilMin(Category.CHANNELS)
 
-    /** 向上取整到分钟，便于家长核对“今天已用满 N 分钟”。 */
+    /** 向上取整到分钟，便于家长核对"今天已用满 N 分钟"。 */
     private fun usedCeilMin(cat: Category): Int =
         ((UsageStore.usedSeconds(cat) + 59) / 60).toInt()
 
     fun stateDescription(): String {
-        return when (state) {
+        val cs = catState(activeCategory)
+        return when (cs.state) {
             EngineState.NORMAL -> when {
-                activeCategory.monitored() && unlockUntilLeave -> "放行中（离开本页后恢复）"
+                activeCategory.monitored() && cs.unlockUntilLeave -> "放行中（离开本页后恢复）"
                 activeCategory.monitored() -> "盯防中（${activeCategory.label}）"
                 else -> "空闲"
             }
-            EngineState.GRACE -> "缓冲中，剩余 ${graceRemainMs / 1000} 秒"
-            EngineState.LOCKED -> "已拦截：${ProcessState.lockCategory.label}"
+            EngineState.GRACE -> "缓冲中，剩余 ${cs.graceRemainMs / 1000} 秒"
+            EngineState.LOCKED -> "已拦截：${activeCategory.label}"
         }
     }
 
@@ -259,5 +335,5 @@ object GuardEngine {
 /** 引擎内使用的字符串封装，避免把长字符串写进逻辑类。 */
 private object CfgCtx {
     val title: String = "使用时间提醒"
-    fun graceBody(cat: Category, sec: Long): String = "${cat.label} 今日额度已用完，$sec 秒后将锁定"
+    fun graceBody(cat: Category): String = "${cat.label} 今日额度已用完，缓冲结束后将锁定"
 }

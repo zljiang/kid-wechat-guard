@@ -47,7 +47,11 @@ object NotificationHelper {
             .build()
     }
 
-    fun showGraceReminder(title: String, body: String) {
+    /**
+     * 缓冲期提醒：只在缓冲开始时发布一次，剩余时间由系统倒计时（chronometer）
+     * 自行刷新，避免引擎每秒 notify 造成频繁更新。
+     */
+    fun showGraceReminder(title: String, body: String, durationMs: Long) {
         val ctx = context ?: return
         nm?.notify(
             NOTIF_ID_GRACE,
@@ -55,6 +59,9 @@ object NotificationHelper {
                 .setSmallIcon(R.drawable.ic_shield)
                 .setContentTitle(title)
                 .setContentText(body)
+                .setWhen(System.currentTimeMillis() + durationMs)
+                .setUsesChronometer(true)
+                .setChronometerCountDown(true)
                 .setAutoCancel(true)
                 .build()
         )
